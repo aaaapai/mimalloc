@@ -1,0 +1,241 @@
+name: LWJGL Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev3
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  S3_PARAMS: --cache-control "public,must-revalidate,proxy-revalidate,max-age=0"
+  MI_PARAMS: -DMI_OVERRIDE=OFF -DMI_OSX_INTERPOSE=OFF -DMI_OSX_ZONE=OFF -DMI_WIN_REDIRECT=OFF -DMI_BUILD_STATIC=OFF -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    container:
+      image: almalinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [ x64 ]
+        include:
+          - ARCH: x64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install git
+        run: dnf -y install git
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Install build dependencies
+        run: |
+          dnf -y install epel-release wget
+          dnf config-manager --set-enabled powertools
+          dnf -y update
+          dnf -y install gcc-toolset-15-gcc gcc-toolset-15-gcc-c++ cmake awscli
+      - name: Configure build
+        run: |
+          source /opt/rh/gcc-toolset-15/enable || true
+          cmake -B build \
+            -DCMAKE_C_FLAGS:STRING="${CMAKE_C_FLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" \
+            $MI_PARAMS
+      - name: Build
+        run: |
+          source /opt/rh/gcc-toolset-15/enable || true
+          cmake --build build --parallel
+          strip build/libmimalloc.so
+      - name: Upload artifact
+        run: aws s3 cp build/libmimalloc.so s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git config --global --add safe.directory $(pwd)
+          git log --first-parent --pretty=format:%H --skip 1 -n 1 > revision.git
+          cat revision.git
+          echo
+          aws s3 cp revision.git s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/libmimalloc.so.git ${{env.S3_PARAMS}}
+
+  linux-cross:
+    name: Linux Cross
+    runs-on: ${{matrix.RUNNER}}
+    strategy:
+      fail-fast: false
+      matrix:
+        ARCH: [arm32, arm64, ppc64le, riscv64]
+        include:
+          - ARCH: arm32
+            RUNNER: ubuntu-22.04
+            CROSS_ARCH: armhf
+            TRIPLET: arm-linux-gnueabihf
+            GCC: 12
+          - ARCH: arm64
+            RUNNER: ubuntu-22.04
+            CROSS_ARCH: arm64
+            TRIPLET: aarch64-linux-gnu
+            GCC: 12
+          - ARCH: ppc64le
+            RUNNER: ubuntu-22.04
+            CROSS_ARCH: ppc64el
+            TRIPLET: powerpc64le-linux-gnu
+            GCC: 12
+          - ARCH: riscv64
+            RUNNER: ubuntu-24.04
+            CROSS_ARCH: riscv64
+            TRIPLET: riscv64-linux-gnu
+            GCC: 14
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          DEBIAN_FRONTEND=noninteractive sudo apt-get -yq update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get -yq install cmake \
+            gcc-${{matrix.GCC}}-${{matrix.TRIPLET}} \
+            libc6-dev-${{matrix.CROSS_ARCH}}-cross
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Configure build
+        run: |
+          export PKG_CONFIG_LIBDIR="/usr/lib/${{matrix.TRIPLET}}/pkgconfig:/usr/share/pkgconfig"
+          CC=${{matrix.TRIPLET}}-gcc-${{matrix.GCC}} cmake -B build \
+            -DCMAKE_C_FLAGS:STRING="${CMAKE_C_FLAGS} -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" \
+            $MI_PARAMS
+      - name: Build
+        run: |
+          cmake --build build --parallel
+          ${{matrix.TRIPLET}}-strip build/libmimalloc.so
+      - name: Upload artifact
+        run: aws s3 cp build/libmimalloc.so s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git config --global --add safe.directory $(pwd)
+          git log --first-parent --pretty=format:%H --skip 1 -n 1 > revision.git
+          cat revision.git
+          echo
+          aws s3 cp revision.git s3://lwjgl-build/nightly/linux/${{matrix.ARCH}}/libmimalloc.so.git ${{env.S3_PARAMS}}
+
+  freebsd-cross:
+    name: FreeBSD Cross
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Start VM
+        uses: cross-platform-actions/action@v1.3.0
+        with:
+          operating_system: freebsd
+          architecture: x86-64
+          version: '14.4'
+          memory: 4G
+          environment_variables: MI_PARAMS
+      - name: Install build dependencies
+        shell: cpa.sh {0}
+        run: sudo pkg install -y cmake gmake
+      - name: Configure build
+        shell: cpa.sh {0}
+        run: cmake -B build $MI_PARAMS -DCMAKE_C_FLAGS="-std=c99 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"
+      - name: Build
+        shell: cpa.sh {0}
+        run: |
+          cmake --build build --parallel
+          strip build/libmimalloc.so
+      - name: Upload artifact
+        run: aws s3 cp build/libmimalloc.so s3://lwjgl-build/nightly/freebsd/x64/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git config --global --add safe.directory $PWD
+          git log --first-parent --pretty=format:%H --skip 1 -n 1 > revision.git
+          cat revision.git
+          echo
+          aws s3 cp revision.git s3://lwjgl-build/nightly/freebsd/x64/libmimalloc.so.git ${{env.S3_PARAMS}}
+
+  macos:
+    name: macOS
+    runs-on: ${{matrix.RUNNER}}
+    strategy:
+      matrix:
+        ARCH: [x64, arm64]
+        include:
+          - ARCH: x64
+            RUNNER: macos-26-intel
+            CMAKE_PARAMS: -DCMAKE_OSX_DEPLOYMENT_TARGET=10.11 -DCMAKE_OSX_ARCHITECTURES=x86_64
+          - ARCH: arm64
+            RUNNER: macos-26
+            CMAKE_PARAMS: -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_ARCHITECTURES=arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Configure build
+        run: cmake -B build $MI_PARAMS ${{matrix.CMAKE_PARAMS}}
+      - name: Build
+        run: |
+          cmake --build build --parallel
+          strip -u -r build/libmimalloc.dylib
+      - name: Upload artifact
+        run: aws s3 cp build/libmimalloc.dylib s3://lwjgl-build/nightly/macosx/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%H --skip 1 -n 1 > revision.git
+          cat revision.git
+          echo
+          aws s3 cp revision.git s3://lwjgl-build/nightly/macosx/${{matrix.ARCH}}/libmimalloc.dylib.git ${{env.S3_PARAMS}}
+
+  windows:
+    name: Windows
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        ARCH: [x86, x64, arm64]
+        include:
+          - ARCH: x86
+            PLATFORM: Win32
+            VCTOOLS: x86.x64
+          - ARCH: x64
+            PLATFORM: x64
+            VCTOOLS: x86.x64
+          - ARCH: arm64
+            PLATFORM: ARM64
+            VCTOOLS: ARM64
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      #      - name: Install Visual Studio 2026 Build Tools
+      #        shell: pwsh
+      #        run: |
+      #          choco install cmake
+      #          choco install visualstudio2026buildtools --package-parameters "`
+      #            --add Microsoft.VisualStudio.Workload.VCTools `
+      #            --add Microsoft.VisualStudio.Component.VC.Tools.${{matrix.VCTOOLS}} `
+      #            --includeRecommended `
+      #            --quiet" `
+      #            -y `
+      #            --ignore-package-exit-codes=3010
+      - name: Configure build
+        #-T ClangCL
+        run: cmake -B build -G "Visual Studio 17 2022" -A ${{matrix.PLATFORM}} %MI_PARAMS% -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded$<$<CONFIG:Debug>:Debug>"
+      - name: Build
+        run: cmake --build build --parallel --config Release
+      - name: Upload artifact
+        run: aws s3 cp build\Release\mimalloc.dll s3://lwjgl-build/nightly/windows/${{matrix.ARCH}}/ ${{env.S3_PARAMS}}
+      - name: Upload git revision
+        run: |
+          git log --first-parent --pretty=format:%%H --skip 1 -n 1 > revision.git
+          type revision.git
+          echo(
+          aws s3 cp revision.git s3://lwjgl-build/nightly/windows/${{matrix.ARCH}}/mimalloc.dll.git ${{env.S3_PARAMS}}
